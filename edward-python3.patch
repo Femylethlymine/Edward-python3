@@ -1,0 +1,253 @@
+--- edward.orig
++++ edward
+@@ -37,6 +37,7 @@
+ import sys
+ import enum
+ import gpgme
++import gpg
+ import smtplib
+ import importlib
+ 
+@@ -1067,7 +1068,7 @@
+     fp = io.BytesIO(key_block.encode('ascii'))
+ 
+     try:
+-        result = gpgme_ctx.import_(fp)
++        result = gpgme_ctx.key_import(fp)
+         imports = result.imports
+     except gpgme.GpgmeError:
+         imports = []
+@@ -1076,7 +1077,7 @@
+     key_cannot_encrypt = False
+ 
+     for import_res in imports:
+-        fingerprint = import_res[0]
++        fingerprint = import_res.fpr
+ 
+         try:
+             key_obj = gpgme_ctx.get_key(fingerprint)
+@@ -1096,103 +1097,103 @@
+ 
+ 
+ def verify_sig_message (msg_block, gpgme_ctx):
+-    """Verifies the signature of a signed, ascii-armored block of text.
+-
+-    It encodes the string into ascii, since binary GPG files are currently
+-    unsupported, and alternative, the ascii-armored format is encodable into
+-    ascii.
+-
+-    Args:
+-        msg_block: a GPG Message block in string form. It may be encrypted or
+-            not. If it is encrypted, it will return empty results.
+-        gpgme_ctx: the gpgme context
+-
+-    Returns:
+-        A tuple containing the plaintext bytes of the signed part, the list of
+-        fingerprints of encryption-capable keys signing the data, a boolean
+-        marking whether edward is missing all public keys for validating any of
+-        the signatures, and a boolean marking whether all sigs' keys are
+-        incapable of encryption. If verification failed, perhaps because the
+-        message was also encrypted, sensible default values are returned.
+-    """
+-
+-    block_b = io.BytesIO(msg_block.encode('ascii'))
+-    plain_b = io.BytesIO()
+-
++    """Verifies a signed GPG message and returns plaintext and signers."""
+     try:
+-        sigs = gpgme_ctx.verify(block_b, None, plain_b)
+-    except gpgme.GpgmeError:
+-        return ("",[],False,False)
+-
+-    plaintext_b = plain_b.getvalue()
+-
+-    (fingerprints, sigkey_missing, key_cannot_encrypt) = get_signature_fp(sigs, gpgme_ctx)
+-
+-    return (plaintext_b, fingerprints, sigkey_missing, key_cannot_encrypt)
+-
++        plaintext_b, verify_result = gpgme_ctx.verify(
++            msg_block.encode('ascii')
++        )
++    except gpg.errors.BadSignatures as exc:
++        results = getattr(exc, 'results', None)
++        if results and len(results) > 1:
++            plaintext_b = results[0]
++            verify_result = results[1]
++        else:
++            return (b"", [], False, False)
++    except (gpgme.GpgmeError, ValueError):
++        return (b"", [], False, False)
+ 
+-def verify_detached_signature (detached_sig, plaintext_bytes, gpgme_ctx):
+-    """Verifies the signature of a detached signature.
++    if verify_result is None:
++        sigs = []
++    else:
++        sigs = [
++            sig for sig in verify_result.signatures
++            if sig is not None
++        ]
+ 
+-    This requires the signature part and the signed part as separate arguments.
++    (fingerprints, sigkey_missing, key_cannot_encrypt) = get_signature_fp(
++        sigs, gpgme_ctx
++    )
+ 
+-    Args:
+-        detached_sig: the signature part of the detached signature
+-        plaintext_bytes: the byte form of the message being signed.
+-        gpgme_ctx: the gpgme context
++    return (
++        plaintext_b,
++        fingerprints,
++        sigkey_missing,
++        key_cannot_encrypt
++    )
+ 
+-    Returns:
+-        A tuple containging a list of encryption capable signing fingerprints
+-        if the signature verification was sucessful, a boolean marking whether
+-        edward is missing all public keys for validating any of the signatures,
+-        and a boolean marking whether all signing keys are incapable of
+-        encryption.  Otherwise, a tuple containing an empty list and True are
+-        returned.
+-    """
+ 
+-    detached_sig_fp = io.BytesIO(detached_sig.encode('ascii'))
+-    plaintext_fp = io.BytesIO(plaintext_bytes)
+ 
++def verify_detached_signature (detached_sig, plaintext_bytes, gpgme_ctx):
++    """Verifies a detached signature over plaintext bytes."""
+     try:
+-        sigs = gpgme_ctx.verify(detached_sig_fp, plaintext_fp, None)
+-    except gpgme.GpgmeError:
+-        return ([],False,False)
+-
+-    (fingerprints, sigkey_missing, key_cannot_encrypt) = get_signature_fp(sigs, gpgme_ctx)
+-
+-    return (fingerprints, sigkey_missing, key_cannot_encrypt)
+-
++        unused_plaintext, verify_result = gpgme_ctx.verify(
++            plaintext_bytes,
++            signature=detached_sig.encode('ascii')
++        )
++    except gpg.errors.BadSignatures as exc:
++        results = getattr(exc, 'results', None)
++        if results and len(results) > 1:
++            verify_result = results[1]
++        else:
++            return ([], True, False)
++    except (gpgme.GpgmeError, ValueError):
++        return ([], False, False)
+ 
+-def decrypt_block (msg_block, gpgme_ctx):
+-    """Decrypts a block of GPG text and verifies any included sigatures.
++    if verify_result is None:
++        sigs = []
++    else:
++        sigs = [
++            sig for sig in verify_result.signatures
++            if sig is not None
++        ]
+ 
+-    Some encypted messages have embeded signatures, so those are verified too.
++    (fingerprints, sigkey_missing, key_cannot_encrypt) = get_signature_fp(
++        sigs, gpgme_ctx
++    )
+ 
+-    Args:
+-        msg_block: the encrypted(/signed) text
+-        gpgme_ctx: the gpgme context
++    return (
++        fingerprints,
++        sigkey_missing,
++        key_cannot_encrypt
++    )
+ 
+-    Returns:
+-        A tuple containing plaintext bytes, encryption-capable signatures (if
+-        decryption and signature verification were successful, respectively), a
+-        boolean marking whether edward is missing all public keys for
+-        validating any of the signatures, and a boolean marking whether all
+-        signature keys are incapable of encryption.
+-    """
+ 
+-    block_b = io.BytesIO(msg_block.encode('ascii'))
+-    plain_b = io.BytesIO()
+ 
++def decrypt_block (msg_block, gpgme_ctx):
++    """Decrypts a block of GPG text and verifies included signatures."""
+     try:
+-        sigs = gpgme_ctx.decrypt_verify(block_b, plain_b)
+-    except gpgme.GpgmeError:
+-        return ("",[],False,False)
++        plaintext_b, decrypt_result, verify_result = gpgme_ctx.decrypt(
++            msg_block.encode('ascii'),
++            verify=True
++        )
++    except (gpgme.GpgmeError, ValueError):
++        return ("", [], False, False)
+ 
+-    plaintext_b = plain_b.getvalue()
++    if verify_result is None:
++        sigs = []
++    else:
++        sigs = verify_result.signatures
+ 
+-    (fingerprints, sigkey_missing, key_cannot_encrypt) = get_signature_fp(sigs, gpgme_ctx)
++    (fingerprints, sigkey_missing, key_cannot_encrypt) = get_signature_fp(
++        sigs, gpgme_ctx
++    )
+ 
+-    return (plaintext_b, fingerprints, sigkey_missing, key_cannot_encrypt)
++    return (
++        plaintext_b,
++        fingerprints,
++        sigkey_missing,
++        key_cannot_encrypt
++    )
+ 
+ 
+ def get_signature_fp (sigs, gpgme_ctx):
+@@ -1218,7 +1219,7 @@
+     fingerprints = []
+ 
+     for sig in sigs:
+-        if (sig.summary == 0) or (sig.summary & gpgme.SIGSUM_VALID != 0) or (sig.summary & gpgme.SIGSUM_GREEN != 0):
++        if (sig.summary == 0) or (sig.summary & gpg.constants.SIGSUM_VALID != 0) or (sig.summary & gpg.constants.SIGSUM_GREEN != 0):
+             try:
+                 key_obj = gpgme_ctx.get_key(sig.fpr)
+             except:
+@@ -1235,7 +1236,7 @@
+                 key_cannot_encrypt = True
+ 
+         elif fingerprints == []:
+-            if (sig.summary & gpgme.SIGSUM_KEY_MISSING != 0):
++            if (sig.summary & gpg.constants.SIGSUM_KEY_MISSING != 0):
+                 sigkey_missing = True
+ 
+     return (fingerprints, sigkey_missing, key_cannot_encrypt)
+@@ -1463,15 +1464,15 @@
+         An encrypted and signed string of text
+     """
+ 
+-    # the plaintext should be mime encoded in an ascii-compatible form
+-    plaintext_bytes = io.BytesIO(plaintext.encode('ascii'))
+-    encrypted_bytes = io.BytesIO()
+-
+-    gpgme_ctx.encrypt_sign([encrypt_to_key], gpgme.ENCRYPT_ALWAYS_TRUST,
+-            plaintext_bytes, encrypted_bytes)
++    # The plaintext should be MIME encoded in an ASCII-compatible form.
++    encrypted_b, encrypt_result, sign_result = gpgme_ctx.encrypt(
++        plaintext.encode('ascii'),
++        recipients=[encrypt_to_key],
++        sign=True,
++        always_trust=True
++    )
+ 
+-    encrypted_txt = encrypted_bytes.getvalue().decode('ascii')
+-    return encrypted_txt
++    return encrypted_b.decode('ascii')
+ 
+ 
+ def error (error_msg):

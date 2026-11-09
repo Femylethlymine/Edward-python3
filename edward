@@ -1,0 +1,1556 @@
+#! /usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""*********************************************************************
+* Edward is free software: you can redistribute it and/or modify       *
+* it under the terms of the GNU Affero Public License as published by  *
+* the Free Software Foundation, either version 3 of the License, or    *
+* (at your option) any later version.                                  *
+*                                                                      *
+* Edward is distributed in the hope that it will be useful,            *
+* but WITHOUT ANY WARRANTY; without even the implied warranty of       *
+* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the        *
+* GNU Affero Public License for more details.                          *
+*                                                                      *
+* You should have received a copy of the GNU Affero Public License     *
+* along with Edward.  If not, see <http://www.gnu.org/licenses/>.      *
+*                                                                      *
+* Copyright (C) 2014-2015 Andrew Engelbrecht                (AGPLv3+)  *
+* Copyright (C) 2014      Josh Drake                        (AGPLv3+)  *
+* Copyright (C) 2014      Lisa Marie Maginnis               (AGPLv3+)  *
+* Copyright (C) 2009-2015 Tails developers <tails@boum.org> ( GPLv3+)  *
+* Copyright (C) 2009      W. Trevor King <wking@drexel.edu> ( GPLv2+)  *
+*                                                                      *
+* Special thanks to Josh Drake for writing the original edward bot! :) *
+*                                                                      *
+************************************************************************
+
+Code sourced from these projects:
+
+  * http://agpl.fsf.org/emailselfdefense.fsf.org/edward/PREVIOUS-20150530/edward.tar.gz
+  * https://git-tails.immerda.ch/whisperback/tree/whisperBack/encryption.py?h=feature/python3
+  * http://www.physics.drexel.edu/~wking/code/python/send_pgp_mime
+"""
+
+import re
+import io
+import os
+import sys
+import enum
+import gpgme
+import gpg
+import smtplib
+import importlib
+
+import email.parser
+import email.message
+import email.encoders
+
+from email.mime.text            import MIMEText
+from email.mime.multipart       import MIMEMultipart
+from email.mime.application     import MIMEApplication
+from email.mime.nonmultipart    import MIMENonMultipart
+
+try:
+    edward_config = importlib.import_module("edward_config")
+except ModuleNotFoundError as exc:
+    if exc.name != "edward_config":
+        raise
+    # Allow deployments without a separate config module to provide settings
+    # through the environment instead.
+    from types import SimpleNamespace
+
+    edward_config = SimpleNamespace(
+        gnupghome=os.environ.get("GNUPGHOME", os.path.expanduser("~/.gnupg")),
+        sign_with_key=os.environ.get("EDWARD_SIGN_WITH_KEY"),
+        hostname=os.environ.get("EDWARD_HOSTNAME", "localhost"),
+        debug=False,
+    )
+
+langs = ["de", "el", "en", "es", "fr", "it", "ja", "pt-br", "ro", "ru", "tr", "zh"]
+
+"""This list contains the abbreviated names of reply languages available to
+edward."""
+
+class TxtType (enum.Enum):
+    text        = 0
+    message     = 1
+    pubkey      = 2
+    detachedsig = 3
+    signature   = 4
+
+
+match_pairs =  [(TxtType.message,
+                '-----BEGIN PGP MESSAGE-----.*?-----END PGP MESSAGE-----'),
+                (TxtType.pubkey,
+                '-----BEGIN PGP PUBLIC KEY BLOCK-----.*?-----END PGP PUBLIC KEY BLOCK-----'),
+                (TxtType.detachedsig,
+                '-----BEGIN PGP SIGNATURE-----.*?-----END PGP SIGNATURE-----')]
+
+"""This list of tuples matches query names with re.search() queries used
+to find GPG data for edward to process."""
+
+
+class EddyMsg (object):
+    """
+    The EddyMsg class represents relevant parts of a mime message.
+
+    The represented message can be single-part or multi-part.
+
+    'multipart' is set to True if there are multiple mime parts.
+
+    'subparts' points to a list of mime sub-parts if it is a multi-part
+    message. Otherwise it points to an empty list.
+
+    'payload_bytes' is a binary representation of the mime part before header
+    removal and message decoding.
+
+    'payload_pieces' is a list of objects containing strings that when strung
+    together form the fully-decoded string representation of the mime part.
+
+    The 'filename', 'content_type', 'content_disposition' and
+    'description_list' come from the mime part parameters.
+
+    """
+
+    multipart               = False
+    subparts                = []
+
+    payload_bytes           = None
+    payload_pieces          = []
+
+    filename                = None
+    content_type            = None
+    content_disposition     = None
+    description_list        = None
+
+
+class PayloadPiece (object):
+    """
+    PayloadPiece represents a complte or sub-section of a mime part.
+
+    Instances of this class are often strung together within one or more arrays
+    pointed to by each instance of the EddyMsg class.
+
+    'piece_type' refers to an enum whose value describes the content of
+    'string'.  Examples include TxtType.pubkey, for public keys, and
+    TxtType.message, for encrypted data (or armored signatures until they are
+    known to be such.) Some of the names derive from the header and footer of
+    each of these ascii-encoded gpg blocks.
+
+    'string' contains some string of text, such as non-GPG text, an encrypted
+    block of text, a signature, or a public key.
+
+    'gpg_data' points to any instances of GPGData that have been created based
+    on the contents of 'string'.
+    """
+
+    piece_type              = None
+    string                  = None
+    gpg_data                = None
+
+
+class GPGData (object):
+    """
+    GPGData holds info from decryption, sig. verification, and/or pub. keys.
+
+    Instances of this class contain decrypted information, signature
+    fingerprints and/or fingerprints of processed and imported public keys.
+
+    'decrypted' is set to True if 'plainobj' was created from encrypted data.
+
+    'plainobj' points to any decrypted, or signed part of, a GPG signature. It
+    is intended to be an instance of the EddyMsg class.
+
+    'sigs' is a list of fingerprints of keys used to sign the data in plainobj.
+
+    'sigkey_missing' is set to True if edward doesn't have the key it needs to
+    verify the signature on a block of text.
+
+    'key_cannot_encrypt' is set to True if pubkeys or sigs' keys in the payload
+    piece are not capable of encryption, are revoked or expired, for instance.
+
+    'keys' is a list of fingerprints of keys obtained in public key blocks.
+    """
+
+    decrypted               = False
+
+    plainobj                = None
+    sigs                    = []
+    sigkey_missing          = False
+    key_cannot_encrypt      = False
+    keys                    = []
+
+
+class ReplyInfo (object):
+    """
+    ReplyInfo contains details that edward uses in generating its reply.
+
+    Instances of this class contain information about whether a message was
+    successfully encrypted or signed, and whether a public key was attached, or
+    retrievable, from the local GPG store. It stores the fingerprints of
+    potential encryption key candidates and the message (if any at all) to
+    quote in edward's reply.
+
+    'replies' points one of the dictionaries of translated replies.
+
+    'target_key' refers to the fingerprint of a key used to sign encrypted
+    data. This is the preferred key, if it is set, and if is available.
+
+    'fallback_target_key' referst to the fingerprint of a key used to sign
+    unencrypted data; alternatively it may be a public key attached to the
+    message.
+
+    'encrypt_to_key' the key object to use when encrypting edward's reply
+
+    'msg_to_quote' refers to the part of a message which edward should quote in
+    his reply. This should remain as None if there was no encrypted and singed
+    part. This is to avoid making edward a service for decrypting other
+    people's messages to edward.
+
+    'decrypt_success' is set to True if edward could decrypt part of the
+    message.
+
+    'sig_success' is set to True if edward could to some extent verify the
+    signature of a signed part of the message to edward.
+
+    'key_can_encrypt' is set to True if a key which can be encrypted to has
+    been found.
+
+    'sig_failure' is set to True if edward could not verify a siganture.
+
+    'pubkey_success' is set to True if edward successfully imported a public
+    key.
+
+    'sigkey_missing' is set to True if edward doesn't have the public key
+    needed for signature verification.
+
+    'key_cannot_encrypt' is set to True if pubkeys or sig's keys in a payload
+    piece of the message are not capable of encryption.
+
+    'have_repy_key' is set to True if edward has a public key to encrypt its
+    reply to.
+    """
+
+    replies                 = None
+
+    target_key              = None
+    fallback_target_key     = None
+    encrypt_to_key          = None
+    msg_to_quote            = ""
+
+    decrypt_success         = False
+    sig_success             = False
+    pubkey_success          = False
+    key_can_encrypt         = False
+
+    decrypt_failure         = False
+    sig_failure             = False
+    sigkey_missing          = False
+    key_cannot_encrypt      = False
+
+    have_reply_key          = False
+
+
+def main ():
+
+    """
+    This is the main function for edward, a GPG reply bot.
+
+    Edward responds to GPG-encrypted and signed mail, encrypting and signing
+    the response if the user's public key is, or was, included in the message.
+
+    Args:
+        None
+
+    Returns:
+        Nothing
+
+    Pre:
+        Mime or plaintext email passing in through standard input.  Portions of
+        the email may be encrypted. If the To: address contains the text
+        "edward-ja", then the reply will contain a reply written in the
+        Japanese language.  There are other languages as well. The default
+        language is English.
+
+    Post:
+        A reply email will be printed to standard output. The contents of the
+        reply email depends on whether the original email was encrypted or not,
+        has or doesn't have a signature, whether a public key used in the
+        original message is provided or locally stored, and the language
+        implied by the To: address in the original email.
+    """
+
+    print_reply_only = handle_args()
+
+    email_bytes = sys.stdin.buffer.read()
+
+    test_auto_reply(email_bytes)
+
+    gpgme_ctx = get_gpg_context(edward_config.gnupghome,
+                              edward_config.sign_with_key)
+
+    # do this twice so sigs can be verified with newly imported keys
+    parse_pgp_mime(email_bytes, gpgme_ctx)
+    email_struct = parse_pgp_mime(email_bytes, gpgme_ctx)
+
+    email_to, email_reply_to, email_subject = email_to_reply_to_subject(email_bytes)
+    lang, reply_from = import_lang_pick_address(email_to, edward_config.hostname)
+
+    replyinfo_obj = ReplyInfo()
+    replyinfo_obj.replies = lang.replies
+
+    prepare_for_reply(email_struct, replyinfo_obj)
+    get_key_from_fp(replyinfo_obj, gpgme_ctx)
+    reply_plaintext = write_reply(replyinfo_obj)
+
+    reply_mime = generate_encrypted_mime(reply_plaintext, email_reply_to, reply_from, \
+                                         email_subject, replyinfo_obj.encrypt_to_key,
+                                         gpgme_ctx)
+
+    if print_reply_only == True:
+        print(reply_mime)
+    else:
+        send_reply(reply_mime, email_reply_to, reply_from)
+
+
+def get_gpg_context (gnupghome, sign_with_key_fp):
+    """
+    This function returns the GPG context needed for encryption and signing.
+
+    The context is needed by other functions which use GPG functionality.
+
+    Args:
+        gnupghome: The path to "~/.gnupg/" or its alternative.
+        sign_with_key: The fingerprint of the key to sign with
+
+    Returns:
+        A gpgme context to be used for GPG functions.
+
+    Post:
+        the 'armor' flag is set to True and the list of signing keys contains
+        the single specified key
+    """
+
+    os.environ['GNUPGHOME'] = gnupghome
+
+    gpgme_ctx = gpgme.Context()
+    gpgme_ctx.armor = True
+
+    try:
+        sign_with_key = gpgme_ctx.get_key(sign_with_key_fp)
+    except gpgme.GpgmeError:
+        error("unable to load signing key. is the gnupghome "
+                + "and signing key properly set in the edward_config.py?")
+        exit(1)
+
+    gpgme_ctx.signers = [sign_with_key]
+
+    return gpgme_ctx
+
+
+def parse_pgp_mime (email_bytes, gpgme_ctx):
+    """Parses the email for mime payloads and decrypts/verfies signatures.
+
+    This function creates a representation of a mime or plaintext email with
+    the EddyMsg class. It then splits each mime payload into one or more pieces
+    which may be plain text or GPG data. It then decrypts encrypted parts and
+    does some very basic signature verification on those parts.
+
+    Args:
+        email_bytes: an email message in byte string format
+        gpgme_ctx:  a gpgme context
+
+    Returns:
+        A message as an instance of EddyMsg
+
+    Post:
+        the returned EddyMsg instance has split, decrypted, verified and pubkey
+        imported payloads
+    """
+
+    email_struct = email.parser.BytesParser().parsebytes(email_bytes)
+
+    eddymsg_obj = parse_mime(email_struct)
+    split_payloads(eddymsg_obj)
+    gpg_on_payloads(eddymsg_obj, gpgme_ctx)
+
+    return eddymsg_obj
+
+
+def parse_mime(msg_struct):
+    """Translates python's email.parser format into an EddyMsg format
+
+    If the message is multi-part, then a recursive object is created, where
+    each sub-part is also a EddyMsg instance.
+
+    Args:
+        msg_struct: an email parsed with email.parser.BytesParser(), which can be
+            multi-part
+
+    Returns:
+        an instance of EddyMsg, potentially a recursive one.
+    """
+
+    eddymsg_obj = get_subpart_data(msg_struct)
+
+    if msg_struct.is_multipart() == True:
+        payloads = msg_struct.get_payload()
+
+        eddymsg_obj.multipart = True
+        eddymsg_obj.subparts = list(map(parse_mime, payloads))
+
+    return eddymsg_obj
+
+
+def scan_and_split (payload_piece, match_name, pattern):
+    """This splits the payloads of an EddyMsg object into GPG and text parts.
+
+    An EddyMsg object's payload_pieces starts off as a list containing a single
+    PayloadPiece object. This function returns a list of these objects which
+    have been split into GPG data and regular text, if such splits need to be/
+    can be made.
+
+    Args:
+        payload_piece: a single payload or a split part of a payload
+        match_name: the type of data to try to spit out from the payload piece
+        pattern: the search pattern to be used for finding that type of data
+
+    Returns:
+        a list of objects of the PayloadPiece class, in the order that the
+        string part of payload_piece originally was, broken up according to
+        matches specified by 'pattern'.
+    """
+
+    # don't try to re-split pieces containing gpg data
+    if payload_piece.piece_type != TxtType.text:
+        return [payload_piece]
+
+    flags = re.DOTALL | re.MULTILINE
+    matches = re.search(pattern, payload_piece.string, flags=flags)
+
+    if matches == None:
+        pieces = [payload_piece]
+
+    else:
+
+        beginning               = PayloadPiece()
+        beginning.string        = payload_piece.string[:matches.start()]
+        beginning.piece_type    = payload_piece.piece_type
+
+        match                   = PayloadPiece()
+        match.string            = payload_piece.string[matches.start():matches.end()]
+        match.piece_type        = match_name
+
+        rest                    = PayloadPiece()
+        rest.string             = payload_piece.string[matches.end():]
+        rest.piece_type         = payload_piece.piece_type
+
+        more_pieces = scan_and_split(rest, match_name, pattern)
+        pieces = [beginning, match ] + more_pieces
+
+    return pieces
+
+
+def get_subpart_data (part):
+    """This function grabs information from a mime part.
+
+    It copies needed data from an email.parser.BytesParser() object over to an
+    EddyMsg object.
+
+    Args:
+        part: an email.parser.BytesParser() object
+
+    Returns:
+        an EddyMsg() object
+    """
+
+    obj = EddyMsg()
+
+    mime_decoded_bytes      = part.get_payload(decode=True)
+    charset                 = part.get_content_charset()
+
+    # your guess is as good as a-myy-ee-ine...
+    if charset == None:
+        charset = 'utf-8'
+
+    payload_string          = part.as_string()
+    if payload_string != None:
+        # convert each isolated carriage return or line feed to carriage return + line feed
+        payload_string_crlf = re.sub(r'\n', '\r\n', re.sub(r'\r', '\n', re.sub(r'\r\n', '\n', payload_string)))
+        obj.payload_bytes   = payload_string_crlf.encode(charset)
+
+    obj.filename            = part.get_filename()
+    obj.content_type        = part.get_content_type()
+    obj.content_disposition = part['content-disposition']
+    obj.description_list    = part['content-description']
+
+    if mime_decoded_bytes != None:
+        try:
+            payload = PayloadPiece()
+            payload.string = mime_decoded_bytes.decode(charset)
+            payload.piece_type = TxtType.text
+
+            obj.payload_pieces = [payload]
+        except UnicodeDecodeError:
+            pass
+
+    return obj
+
+
+def do_to_eddys_pieces (function_to_do, eddymsg_obj, data):
+    """A function which maps another function onto a message's subparts.
+
+    This is a higer-order function which recursively performs a specified
+    function on each subpart of a multi-part message. Each single-part sub-part
+    has the function applied to it. This function also works if the part passed
+    in is single-part.
+
+    Args:
+        function_to_do: function to perform on sub-parts
+        eddymsg_obj: a single part or multi-part EddyMsg object
+        data: a second argument to pass to 'function_to_do'
+
+    Returns:
+        Nothing
+
+    Post:
+        The passed-in EddyMsg object is transformed recursively on its
+        sub-parts according to 'function_to_do'.
+    """
+
+    if eddymsg_obj.multipart == True:
+        for sub in eddymsg_obj.subparts:
+            do_to_eddys_pieces(function_to_do, sub, data)
+    else:
+        function_to_do(eddymsg_obj, data)
+
+
+def split_payloads (eddymsg_obj):
+    """Splits all (sub-)payloads of a message into GPG data and regular text.
+
+    Recursively performs payload splitting on all sub-parts of an EddyMsg
+    object into the various GPG data types, such as GPG messages, public key
+    blocks and signed text.
+
+    Args:
+        eddymsg_obj: an instance of EddyMsg
+
+    Returns:
+        Nothing
+
+    Pre:
+        The EddyMsg object has payloads that are unsplit (by may be split)..
+
+    Post:
+        The EddyMsg object's payloads are all split into GPG and non-GPG parts.
+    """
+
+    for match_pair in match_pairs:
+        do_to_eddys_pieces(split_payload_pieces, eddymsg_obj, match_pair)
+
+
+def split_payload_pieces (eddymsg_obj, match_pair):
+    """A helper function for split_payloads(); works on PayloadPiece objects.
+
+    This function splits up PayloadPiece objects into multipe PayloadPiece
+    objects and replaces the EddyMsg object's previous list of payload pieces
+    with the new split up one.
+
+    Args:
+        eddymsg_obj: a single-part EddyMsg object.
+        match_pair: a tuple from the match_pairs list, which specifies a match
+            name and a match pattern.
+
+    Returns:
+        Nothing
+
+    Pre:
+        The payload piece(s) of an EddyMsg object may be already split or
+        unsplit.
+
+    Post:
+        The EddyMsg object's payload piece(s) are split into a list of pieces
+        if matches of the match_pair are found.
+    """
+
+    (match_name, pattern) = match_pair
+
+    new_pieces_list = []
+    for piece in eddymsg_obj.payload_pieces:
+        new_pieces_list += scan_and_split(piece, match_name, pattern)
+
+    eddymsg_obj.payload_pieces = new_pieces_list
+
+
+def gpg_on_payloads (eddymsg_obj, gpgme_ctx, prev_parts=[]):
+    """Performs GPG operations on the GPG parts of the message
+
+    This function decrypts text, verifies signatures, and imports public keys
+    included in an email.
+
+    Args:
+        eddymsg_obj: an EddyMsg object with its payload_pieces split into GPG
+            and non-GPG sections by split_payloads()
+        gpgme_ctx: a gpgme context
+
+        prev_parts: a list of mime parts that occur before the eddymsg_obj
+            part, under the same multi-part mime part. This is used for
+            verifying detached signatures. For the root mime part, this should
+            be an empty list, which is the default value if this paramater is
+            omitted.
+
+    Return:
+        Nothing
+
+    Pre:
+        eddymsg_obj should have its payloads split into gpg and non-gpg pieces.
+
+    Post:
+        Decryption, verification and key imports occur. the gpg_data members of
+        PayloadPiece objects get filled in with GPGData objects with some of
+        their attributes set.
+    """
+
+    if eddymsg_obj.multipart == True:
+        prev_parts=[]
+        for sub in eddymsg_obj.subparts:
+            gpg_on_payloads (sub, gpgme_ctx, prev_parts)
+            prev_parts += [sub]
+
+        return
+
+    for piece in eddymsg_obj.payload_pieces:
+
+        if piece.piece_type == TxtType.text:
+            # don't transform the plaintext.
+            pass
+
+        elif piece.piece_type == TxtType.message:
+            piece.gpg_data = GPGData()
+
+            (plaintext_b, sigs, sigkey_missing, key_cannot_encrypt) = decrypt_block(piece.string, gpgme_ctx)
+
+            piece.gpg_data.sigkey_missing = sigkey_missing
+            piece.gpg_data.key_cannot_encrypt = key_cannot_encrypt
+
+            if plaintext_b:
+                piece.gpg_data.decrypted = True
+                piece.gpg_data.sigs = sigs
+                # recurse!
+                piece.gpg_data.plainobj = parse_pgp_mime(plaintext_b, gpgme_ctx)
+                continue
+
+            # if not encrypted, check to see if this is an armored signature.
+            (plaintext_b, sigs,  sigkey_missing, key_cannot_encrypt) = verify_sig_message(piece.string, gpgme_ctx)
+
+            piece.gpg_data.sigkey_missing = sigkey_missing
+            piece.gpg_data.key_cannot_encrypt = key_cannot_encrypt
+
+            if plaintext_b:
+                piece.piece_type = TxtType.signature
+                piece.gpg_data.sigs = sigs
+                # recurse!
+                piece.gpg_data.plainobj = parse_pgp_mime(plaintext_b, gpgme_ctx)
+
+        elif piece.piece_type == TxtType.pubkey:
+            piece.gpg_data = GPGData()
+
+            (key_fps, key_cannot_encrypt) = add_gpg_key(piece.string, gpgme_ctx)
+
+            piece.gpg_data.key_cannot_encrypt = key_cannot_encrypt
+
+            if key_fps != []:
+                piece.gpg_data.keys = key_fps
+
+        elif piece.piece_type == TxtType.detachedsig:
+            piece.gpg_data = GPGData()
+
+            for prev in prev_parts:
+                (sig_fps, sigkey_missing, key_cannot_encrypt) = verify_detached_signature(piece.string, prev.payload_bytes, gpgme_ctx)
+
+                piece.gpg_data.sigkey_missing = sigkey_missing
+                piece.gpg_data.key_cannot_encrypt = key_cannot_encrypt
+
+                if sig_fps != []:
+                    piece.gpg_data.sigs = sig_fps
+                    piece.gpg_data.plainobj = prev
+                    break
+
+        else:
+            pass
+
+
+def prepare_for_reply (eddymsg_obj, replyinfo_obj):
+    """Updates replyinfo_obj with info on the message's GPG success/failures
+
+    This function marks replyinfo_obj with information about whether encrypted
+    text in eddymsg_obj was successfully decrypted, signatures were verified
+    and whether a public key was found or not.
+
+    Args:
+        eddymsg_obj: a message in the EddyMsg format
+        replyinfo_obj: an instance of ReplyInfo
+
+    Returns:
+        Nothing
+
+    Pre:
+        eddymsg_obj has had its gpg_data created by gpg_on_payloads
+
+    Post:
+        replyinfo_obj has been updated with info about decryption/sig
+        verififcation status, etc. However the desired key isn't imported until
+        later, so the success or failure of that updates the values set here.
+    """
+
+    do_to_eddys_pieces(prepare_for_reply_pieces, eddymsg_obj, replyinfo_obj)
+
+def prepare_for_reply_pieces (eddymsg_obj, replyinfo_obj):
+    """A helper function for prepare_for_reply
+
+    It updates replyinfo_obj with GPG success/failure information, when
+    supplied a single-part EddyMsg object.
+
+    Args:
+        eddymsg_obj: a single-part message in the EddyMsg format
+        replyinfo_obj: an object which holds information about the message's
+            GPG status
+
+    Returns:
+        Nothing
+
+    Pre:
+        eddymsg_obj is a single-part message. (it may be a part of a multi-part
+        message.) It has had its gpg_data created by gpg_on_payloads if it has
+        gpg data.
+
+    Post:
+        replyinfo_obj has been updated with gpg success/failure information
+    """
+
+    for piece in eddymsg_obj.payload_pieces:
+        if piece.piece_type == TxtType.text:
+            # don't quote the plaintext part.
+            pass
+
+        elif piece.piece_type == TxtType.message:
+            prepare_for_reply_message(piece, replyinfo_obj)
+
+        elif piece.piece_type == TxtType.pubkey:
+            prepare_for_reply_pubkey(piece, replyinfo_obj)
+
+        elif (piece.piece_type == TxtType.detachedsig) \
+            or (piece.piece_type == TxtType.signature):
+                    prepare_for_reply_sig(piece, replyinfo_obj)
+
+
+def prepare_for_reply_message (piece, replyinfo_obj):
+    """Helper function for prepare_for_reply()
+
+    This function is called when the piece_type of a payload piece is
+    TxtType.message, or GPG Message block. This should be encrypted text. If
+    the encryted block is correclty signed, a sig will be attached to
+    .target_key unless there is already one there.
+
+    Args:
+        piece: a PayloadPiece object.
+        replyinfo_obj: object which gets updated with decryption status, etc.
+
+    Returns:
+        Nothing
+
+    Pre:
+        the piece.payload_piece value should be TxtType.message.
+
+    Post:
+        replyinfo_obj gets updated with decryption status, signing status, a
+        potential signing key, posession status of the public key for the
+        signature and encryption capability status if that key is missing.
+    """
+
+    if piece.gpg_data.plainobj == None:
+        replyinfo_obj.decrypt_failure = True
+        return
+
+    replyinfo_obj.decrypt_success = True
+
+    # we already have a key (and a message)
+    if replyinfo_obj.target_key != None:
+        return
+
+    if piece.gpg_data.sigs == []:
+        if piece.gpg_data.sigkey_missing == True:
+            replyinfo_obj.sigkey_missing = True
+
+        if piece.gpg_data.key_cannot_encrypt == True:
+            replyinfo_obj.key_cannot_encrypt = True
+
+        # only include a signed message in the reply.
+        get_signed_part = True
+
+    else:
+        replyinfo_obj.target_key = piece.gpg_data.sigs[0]
+        replyinfo_obj.sig_success = True
+        get_signed_part = False
+
+    flatten_decrypted_payloads(piece.gpg_data.plainobj, replyinfo_obj, get_signed_part)
+
+    # to catch public keys in encrypted blocks
+    prepare_for_reply(piece.gpg_data.plainobj, replyinfo_obj)
+
+
+def prepare_for_reply_pubkey (piece, replyinfo_obj):
+    """Helper function for prepare_for_reply(). Marks pubkey import status.
+
+    Marks replyinfo_obj with pub key import status.
+
+    Args:
+        piece: a PayloadPiece object
+        replyinfo_obj: a ReplyInfo object
+
+    Pre:
+        piece.piece_type should be set to TxtType.pubkey .
+
+    Post:
+        replyinfo_obj has its fields updated.
+    """
+
+    if piece.gpg_data.keys == []:
+        if piece.gpg_data.key_cannot_encrypt == True:
+            replyinfo_obj.key_cannot_encrypt = True
+    else:
+        replyinfo_obj.pubkey_success = True
+
+        # prefer public key as a fallback for the encrypted reply
+        replyinfo_obj.fallback_target_key = piece.gpg_data.keys[0]
+
+
+def prepare_for_reply_sig (piece, replyinfo_obj):
+    """Helper function for prepare_for_reply(). Marks sig verification status.
+
+    Marks replyinfo_obj with signature verification status.
+
+    Args:
+        piece: a PayloadPiece object
+        replyinfo_obj: a ReplyInfo object
+
+    Pre:
+        piece.piece_type should be set to TxtType.signature, or
+        TxtType.detachedsig .
+
+    Post:
+        replyinfo_obj has its fields updated.
+    """
+
+    if piece.gpg_data.sigs == []:
+        replyinfo_obj.sig_failure = True
+
+        if piece.gpg_data.sigkey_missing == True:
+            replyinfo_obj.sigkey_missing = True
+
+        if piece.gpg_data.key_cannot_encrypt == True:
+            replyinfo_obj.key_cannot_encrypt = True
+
+    else:
+        replyinfo_obj.sig_success = True
+
+        if replyinfo_obj.fallback_target_key == None:
+            replyinfo_obj.fallback_target_key = piece.gpg_data.sigs[0]
+
+    if (piece.piece_type == TxtType.signature):
+        # to catch public keys in signature blocks
+        prepare_for_reply(piece.gpg_data.plainobj, replyinfo_obj)
+
+
+def flatten_decrypted_payloads (eddymsg_obj, replyinfo_obj, get_signed_part):
+    """For creating a string representation of a signed, encrypted part.
+
+    When given a decrypted payload, it will add either the plaintext or signed
+    plaintext to the reply message, depeding on 'get_signed_part'. This is
+    useful for ensuring that the reply message only comes from a signed and
+    ecrypted GPG message. It also sets the target_key for encrypting the reply
+    if it's told to get signed text only.
+
+    Args:
+        eddymsg_obj: the message in EddyMsg format created by decrypting GPG
+            text
+        replyinfo_obj: a ReplyInfo object for holding the message to quote and
+            the target_key to encrypt to.
+        get_signed_part: True if we should only include text that contains a
+            further signature. If False, then include plain text.
+
+    Returns:
+        Nothing
+
+    Pre:
+        The EddyMsg instance passed in should be a piece.gpg_data.plainobj
+        which represents decrypted text. It may or may not be signed on that
+        level.
+
+    Post:
+        the ReplyInfo instance may have a new 'target_key' set and its
+        'msg_to_quote' will be updated with (possibly signed) plaintext, if any
+        could be found.
+    """
+
+    if eddymsg_obj == None:
+        return
+
+    # recurse on multi-part mime
+    if eddymsg_obj.multipart == True:
+        for sub in eddymsg_obj.subparts:
+            flatten_decrypted_payloads(sub, replyinfo_obj, get_signed_part)
+
+    for piece in eddymsg_obj.payload_pieces:
+        if (get_signed_part):
+            if ((piece.piece_type == TxtType.detachedsig) \
+                    or (piece.piece_type == TxtType.signature)) \
+                    and (piece.gpg_data != None) \
+                    and (piece.gpg_data.plainobj != None):
+                        flatten_decrypted_payloads(piece.gpg_data.plainobj, replyinfo_obj, False)
+                        replyinfo_obj.target_key = piece.gpg_data.sigs[0]
+                        break
+        else:
+            if (eddymsg_obj.content_disposition == None \
+                    or not eddymsg_obj.content_disposition.startswith("attachment")) \
+                    and piece.piece_type == TxtType.text:
+                replyinfo_obj.msg_to_quote += piece.string
+
+
+def get_key_from_fp (replyinfo_obj, gpgme_ctx):
+    """Obtains a public key object from a key fingerprint
+
+    If the .target_key is not set, then we use .fallback_target_key, if
+    available.
+
+    Args:
+        replyinfo_obj: ReplyInfo instance
+        gpgme_ctx: the gpgme context
+
+    Return:
+        Nothing
+
+    Pre:
+        Loading a key requires that we have the public key imported. This
+        requires that they email contains the pub key block, or that it was
+        previously sent to edward.
+
+    Post:
+        If the key can be loaded, then replyinfo_obj.reply_to_key points to the
+        public key object.  If the key cannot be loaded, then the replyinfo_obj
+        is marked as having no public key available. If the key is not capable
+        of encryption, it will not be used, and replyinfo_obj will be marked
+        accordingly.
+    """
+
+    for key in (replyinfo_obj.target_key, replyinfo_obj.fallback_target_key):
+        if key != None:
+            try:
+                encrypt_to_key = gpgme_ctx.get_key(key)
+
+            except gpgme.GpgmeError:
+                continue
+
+            if is_key_usable(encrypt_to_key):
+                replyinfo_obj.encrypt_to_key = encrypt_to_key
+                replyinfo_obj.have_reply_key = True
+                replyinfo_obj.key_can_encrypt = True
+                return
+
+            else:
+                replyinfo_obj.key_cannot_encrypt = True
+
+
+
+def write_reply (replyinfo_obj):
+    """Write the reply email body about the GPG successes/failures.
+
+    The reply is about whether decryption, sig verification and key
+    import/loading was successful or failed. If text was successfully decrypted
+    and verified, then the first instance of such text will be included in
+    quoted form.
+
+    Args:
+        replyinfo_obj: contains details of GPG processing status
+
+    Returns:
+        the plaintext message to be sent to the user
+
+    Pre:
+        replyinfo_obj should be populated with info about GPG processing status.
+    """
+
+    reply_plain = ""
+
+    if (replyinfo_obj.pubkey_success == True):
+        reply_plain += replyinfo_obj.replies['greeting']
+        reply_plain += "\n\n"
+
+
+    if replyinfo_obj.decrypt_success == True:
+        debug('decrypt success')
+        reply_plain += replyinfo_obj.replies['success_decrypt']
+        reply_plain += "\n\n"
+
+    elif replyinfo_obj.decrypt_failure == True:
+        debug('decrypt failure')
+        reply_plain += replyinfo_obj.replies['failed_decrypt']
+        reply_plain += "\n\n"
+
+
+    if replyinfo_obj.sig_success == True:
+        debug('signature success')
+        reply_plain += replyinfo_obj.replies['sig_success']
+        reply_plain += "\n\n"
+
+    elif replyinfo_obj.sig_failure == True:
+        debug('signature failure')
+        reply_plain += replyinfo_obj.replies['sig_failure']
+        reply_plain += "\n\n"
+
+
+    if (replyinfo_obj.pubkey_success == True):
+        debug('public key received')
+        reply_plain += replyinfo_obj.replies['public_key_received']
+        reply_plain += "\n\n"
+
+    elif (replyinfo_obj.sigkey_missing == True):
+        debug('no public key')
+        reply_plain += replyinfo_obj.replies['no_public_key']
+        reply_plain += "\n\n"
+
+    elif (replyinfo_obj.key_can_encrypt == False) \
+            and (replyinfo_obj.key_cannot_encrypt == True):
+        debug('bad public key')
+        reply_plain += replyinfo_obj.replies['no_public_key']
+        reply_plain += "\n\n"
+
+
+    if (replyinfo_obj.decrypt_success == True) \
+            and (replyinfo_obj.sig_success == True) \
+            and (replyinfo_obj.have_reply_key == True):
+        debug('message quoted')
+        reply_plain += replyinfo_obj.replies['quote_follows']
+        reply_plain += "\n\n"
+        quoted_text = email_quote_text(replyinfo_obj.msg_to_quote)
+        reply_plain += quoted_text
+        reply_plain += "\n\n"
+
+
+    if (reply_plain == ""):
+        debug('plaintext message')
+        reply_plain += replyinfo_obj.replies['failed_decrypt']
+        reply_plain += "\n\n"
+
+
+    reply_plain += replyinfo_obj.replies['signature']
+    reply_plain += "\n\n"
+
+    return reply_plain
+
+
+def add_gpg_key (key_block, gpgme_ctx):
+    """Adds a GPG pubkey to the local keystore
+
+    This adds keys received through email into the key store so they can be
+    used later.
+
+    Args:
+        key_block: the string form of the ascii-armored public key block
+        gpgme_ctx: the gpgme context
+
+    Returns:
+        the fingerprint(s) of the imported key(s) which can be used for
+        encryption, and a boolean marking whether none of the keys are capable
+        of encryption.
+    """
+
+    fp = io.BytesIO(key_block.encode('ascii'))
+
+    try:
+        result = gpgme_ctx.key_import(fp)
+        imports = result.imports
+    except gpgme.GpgmeError:
+        imports = []
+
+    key_fingerprints = []
+    key_cannot_encrypt = False
+
+    for import_res in imports:
+        fingerprint = import_res.fpr
+
+        try:
+            key_obj = gpgme_ctx.get_key(fingerprint)
+        except:
+            key_obj = None
+
+        if key_obj != None and is_key_usable(key_obj):
+            key_fingerprints += [fingerprint]
+            key_cannot_encrypt = False
+
+            debug("added gpg key: " + fingerprint)
+
+        elif key_fingerprints == []:
+            key_cannot_encrypt = True
+
+    return (key_fingerprints, key_cannot_encrypt)
+
+
+def verify_sig_message (msg_block, gpgme_ctx):
+    """Verifies a signed GPG message and returns plaintext and signers."""
+    try:
+        plaintext_b, verify_result = gpgme_ctx.verify(
+            msg_block.encode('ascii')
+        )
+    except gpg.errors.BadSignatures as exc:
+        results = getattr(exc, 'results', None)
+        if results and len(results) > 1:
+            plaintext_b = results[0]
+            verify_result = results[1]
+        else:
+            return (b"", [], False, False)
+    except (gpgme.GpgmeError, ValueError):
+        return (b"", [], False, False)
+
+    if verify_result is None:
+        sigs = []
+    else:
+        sigs = [
+            sig for sig in verify_result.signatures
+            if sig is not None
+        ]
+
+    (fingerprints, sigkey_missing, key_cannot_encrypt) = get_signature_fp(
+        sigs, gpgme_ctx
+    )
+
+    return (
+        plaintext_b,
+        fingerprints,
+        sigkey_missing,
+        key_cannot_encrypt
+    )
+
+
+
+def verify_detached_signature (detached_sig, plaintext_bytes, gpgme_ctx):
+    """Verifies a detached signature over plaintext bytes."""
+    try:
+        unused_plaintext, verify_result = gpgme_ctx.verify(
+            plaintext_bytes,
+            signature=detached_sig.encode('ascii')
+        )
+    except gpg.errors.BadSignatures as exc:
+        results = getattr(exc, 'results', None)
+        if results and len(results) > 1:
+            verify_result = results[1]
+        else:
+            return ([], True, False)
+    except (gpgme.GpgmeError, ValueError):
+        return ([], False, False)
+
+    if verify_result is None:
+        sigs = []
+    else:
+        sigs = [
+            sig for sig in verify_result.signatures
+            if sig is not None
+        ]
+
+    (fingerprints, sigkey_missing, key_cannot_encrypt) = get_signature_fp(
+        sigs, gpgme_ctx
+    )
+
+    return (
+        fingerprints,
+        sigkey_missing,
+        key_cannot_encrypt
+    )
+
+
+
+def decrypt_block (msg_block, gpgme_ctx):
+    """Decrypts a block of GPG text and verifies included signatures."""
+    try:
+        plaintext_b, decrypt_result, verify_result = gpgme_ctx.decrypt(
+            msg_block.encode('ascii'),
+            verify=True
+        )
+    except (gpgme.GpgmeError, ValueError):
+        return ("", [], False, False)
+
+    if verify_result is None:
+        sigs = []
+    else:
+        sigs = verify_result.signatures
+
+    (fingerprints, sigkey_missing, key_cannot_encrypt) = get_signature_fp(
+        sigs, gpgme_ctx
+    )
+
+    return (
+        plaintext_b,
+        fingerprints,
+        sigkey_missing,
+        key_cannot_encrypt
+    )
+
+
+def get_signature_fp (sigs, gpgme_ctx):
+    """Selects valid signatures from output of gpgme signature verifying functions
+
+    get_signature_fp returns a list of valid signature fingerprints if those
+    fingerprints are associated with available keys capable of encryption.
+
+    Args:
+        sigs: a signature verification result object list
+        gpgme_ctx: a gpgme context
+
+    Returns:
+        fingerprints: a list of fingerprints
+        sigkey_missing: a boolean marking whether public keys are missing for
+            all available signatures.
+        key_cannot_encrypt: a boolearn marking whether available public keys are
+            incapable of encryption.
+    """
+
+    sigkey_missing = False
+    key_cannot_encrypt = False
+    fingerprints = []
+
+    for sig in sigs:
+        if (sig.summary == 0) or (sig.summary & gpg.constants.SIGSUM_VALID != 0) or (sig.summary & gpg.constants.SIGSUM_GREEN != 0):
+            try:
+                key_obj = gpgme_ctx.get_key(sig.fpr)
+            except:
+                if fingerprints == []:
+                    sigkey_missing = True
+                    continue
+
+            if is_key_usable(key_obj):
+                fingerprints += [sig.fpr]
+                key_cannot_encrypt = False
+                sigkey_missing = False
+
+            elif fingerprints == []:
+                key_cannot_encrypt = True
+
+        elif fingerprints == []:
+            if (sig.summary & gpg.constants.SIGSUM_KEY_MISSING != 0):
+                sigkey_missing = True
+
+    return (fingerprints, sigkey_missing, key_cannot_encrypt)
+
+
+def is_key_usable (key_obj):
+    """Returns boolean representing key usability regarding encryption
+
+    Tests various feature of key and returns usability
+
+    Args:
+        key_obj: a gpgme key object
+
+    Returns:
+        A boolean representing key usability
+    """
+    if key_obj.can_encrypt and not key_obj.invalid and not key_obj.expired \
+            and not key_obj.revoked and not key_obj.disabled:
+        return True
+    else:
+        return False
+
+
+def test_auto_reply (email_bytes):
+    """Test whether email is auto-generated
+
+    If the email is autogenerated, edward quits without sending a response.
+    This is not a perfect test. Some auto-responses will go undetected.
+
+    Args:
+        email_bytes: the byte string from of the email
+
+    Returns:
+        Nothing, or exits the program
+    """
+
+    email_struct = email.parser.BytesHeaderParser().parsebytes(email_bytes)
+
+    auto_submitted = email_struct['Auto-Submitted']
+
+    if auto_submitted == None or auto_submitted == "no" \
+            or auto_submitted == "No":
+
+        return
+
+    debug("autoreply")
+    exit(0)
+
+
+def email_to_reply_to_subject (email_bytes):
+    """Returns the email's To:, Reply-To: (or From:), and Subject: fields
+
+    Returns this information from an email.
+
+    Args:
+        email_bytes: the byte string form of the email
+
+    Returns:
+        the email To:, Reply-To: (or From:), and Subject: fields as strings
+    """
+
+    email_struct = email.parser.BytesHeaderParser().parsebytes(email_bytes)
+
+    email_to        = email_struct['To']
+    email_from      = email_struct['From']
+    email_reply_to  = email_struct['Reply-To']
+
+    email_subject   = email_struct['Subject']
+
+    if email_reply_to == None:
+        email_reply_to = email_from
+
+    return email_to, email_reply_to, email_subject
+
+
+def import_lang_pick_address(email_to, hostname):
+    """Imports language file for i18n support; makes reply from address
+
+    The language imported depends on the To: address of the email received by
+    edward. an -en ending implies the English language, whereas a -ja ending
+    implies Japanese. The list of supported languages is listed in the 'langs'
+    list at the beginning of the program. This function also chooses the
+    language-dependent address which can be used as the From address in the
+    reply email.
+
+    Args:
+        email_to: the string containing the email address that the mail was
+            sent to.
+        hostname: the hostname part of the reply email's from address
+
+    Returns:
+        the reference to the imported language module. The only variable in
+        this file is the 'replies' dictionary.
+    """
+
+    # default
+    use_lang = "en"
+
+    if email_to != None:
+        for lang in langs:
+            if "edward-" + lang in email_to:
+                use_lang = lang
+                break
+
+    lang_mod_name = "lang." + re.sub('-', '_', use_lang)
+    lang_module = importlib.import_module(lang_mod_name)
+
+    reply_from = "edward-" + use_lang + "@" + hostname
+
+    return lang_module, reply_from
+
+
+def generate_encrypted_mime (plaintext, email_to, email_from, email_subject,
+                    encrypt_to_key, gpgme_ctx):
+    """This function creates the mime email reply. It can encrypt the email.
+
+    If the encrypt_key is included, then the email is encrypted and signed.
+    Otherwise it is unencrypted.
+
+    Args:
+        plaintext: the plaintext body of the message to create.
+        email_to: the email address to reply to
+        email_subject: the subject to use in reply
+        encrypt_to_key: the key object to use for encrypting the email. (or
+            None)
+        gpgme_ctx: the gpgme context
+
+    Returns
+        A string version of the mime message, possibly encrypted and signed.
+    """
+
+    plaintext_mime = MIMEText(plaintext)
+    plaintext_mime.set_charset('utf-8')
+
+    if (encrypt_to_key != None):
+
+        encrypted_text = encrypt_sign_message(plaintext_mime.as_string(),
+                                              encrypt_to_key,
+                                              gpgme_ctx)
+
+        control_mime = MIMEApplication("Version: 1",
+                                       _subtype='pgp-encrypted',
+                                       _encoder=email.encoders.encode_7or8bit)
+        control_mime['Content-Description'] = 'PGP/MIME version identification'
+        control_mime.set_charset('us-ascii')
+
+        encoded_mime = MIMEApplication(encrypted_text,
+                                       _subtype='octet-stream; name="encrypted.asc"',
+                                       _encoder=email.encoders.encode_7or8bit)
+        encoded_mime['Content-Description'] = 'OpenPGP encrypted message'
+        encoded_mime['Content-Disposition'] = 'inline; filename="encrypted.asc"'
+        encoded_mime.set_charset('us-ascii')
+
+        message_mime = MIMEMultipart(_subtype="encrypted", protocol="application/pgp-encrypted")
+        message_mime.attach(control_mime)
+        message_mime.attach(encoded_mime)
+        message_mime['Content-Disposition'] = 'inline'
+
+    else:
+        message_mime = plaintext_mime
+
+    message_mime['Auto-Submitted'] = 'auto-replied'
+
+    message_mime['To'] = email_to
+    message_mime['From'] = email_from
+    message_mime['Subject'] = email_subject
+
+    reply = message_mime.as_string()
+
+    return reply
+
+
+def send_reply(email_txt, reply_to, reply_from):
+    """Sends reply email
+
+    Sent to original sender
+
+    Args:
+        email_txt: message as a string
+        reply_to: recipient of reply
+        reply_from: edward's specific email address
+
+    Post:
+        Email is sent
+    """
+
+    if reply_to == None:
+        error("*** ERROR: No one to send email to.")
+        exit(1)
+
+    s = smtplib.SMTP('localhost')
+    s.sendmail(reply_from, reply_to, email_txt)
+    s.quit()
+
+
+def email_quote_text (text):
+    """Quotes input text by inserting "> "s
+
+    This is useful for quoting a text for the reply message. It inserts "> "
+    strings at the beginning of lines.
+
+    Args:
+        text: plain text to quote
+
+    Returns:
+        Quoted text
+    """
+
+    quoted_message = re.sub(r'^', r'> ', text, flags=re.MULTILINE)
+
+    return quoted_message
+
+
+def encrypt_sign_message (plaintext, encrypt_to_key, gpgme_ctx):
+    """Encrypts and signs plaintext
+
+    This encrypts and signs a message.
+
+    Args:
+        plaintext: text to sign and ecrypt
+        encrypt_to_key: the key object to encrypt to
+        gpgme_ctx: the gpgme context
+
+    Returns:
+        An encrypted and signed string of text
+    """
+
+    # The plaintext should be MIME encoded in an ASCII-compatible form.
+    encrypted_b, encrypt_result, sign_result = gpgme_ctx.encrypt(
+        plaintext.encode('ascii'),
+        recipients=[encrypt_to_key],
+        sign=True,
+        always_trust=True
+    )
+
+    return encrypted_b.decode('ascii')
+
+
+def error (error_msg):
+    """Write an error message to stdout
+
+    The error message includes the program name.
+
+    Args:
+        error_msg: the message to print
+
+    Returns:
+        Nothing
+
+    Post:
+        An error message is printed to stdout
+    """
+
+    sys.stderr.write(progname + ": " + str(error_msg) + "\n")
+
+
+def debug (debug_msg):
+    """Writes a debug message to stdout if debug == True
+
+    If the debug option is set in edward_config.py, then the passed message
+    gets printed to stdout.
+
+    Args:
+        debug_msg: the message to print to stdout
+
+    Returns:
+        Nothing
+
+    Post:
+        A debug message is printed to stdout
+    """
+
+    if edward_config.debug == True:
+        error(debug_msg)
+
+
+def handle_args ():
+    """Sets the progname variable and processes optional argument
+
+    If there are more than two arguments then edward complains and quits. An
+    single "-p" argument sets the print_reply_only option, which makes edward
+    print email replies instead of mailing them.
+
+    Args:
+        None
+
+    Returns:
+        True if edward should print arguments instead of mailing them,
+        otherwise it returns False.
+
+    Post:
+        Exits with error 1 if there are more than two arguments, otherwise
+        returns the print_reply_only option.
+    """
+
+    global progname
+    progname = sys.argv[0]
+
+    print_reply_only = False
+
+    if len(sys.argv) > 2:
+        print(progname + " usage:  " + progname + " [-p]\n\n" \
+                + "        -p      print reply message to stdout, do not mail it\n", \
+                file=sys.stderr)
+        exit(1)
+
+    elif (len(sys.argv) == 2) and (sys.argv[1] == "-p"):
+        print_reply_only = True
+
+    return print_reply_only
+
+
+if __name__ == "__main__":
+    """Executes main if this file is not loaded interactively"""
+
+    main()
+

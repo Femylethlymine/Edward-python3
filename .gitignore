@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local configuration
+edward_config.py
+.env
+.env.*
+*.key
+*.pem
+
+# Private OpenPGP and mail artifacts
+*.eml
+*.asc
+*.gpg
+*.pgp
+*.sig
+
+# Generated plaintext and local test material
+*.decrypted.txt
+*.received-encrypted.asc
+self-*
+received-*
+detached-*
+signed-*
+encrypted.txt
+test-email.txt
+pgp-inner.txt
+
+# Backups and temporary files
+*.bak
+*.working
+*.working.py
+*.tar
+*.tar.gz
+*.sha256
+*~
+
+# The project's committed test fixtures
+!tests/*.eml
